@@ -1,0 +1,135 @@
+# Managed by opengym-setup v1
+name: openGym Oracle
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opengym-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test openGym
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Root tooling
+        run: npm ci
+      - name: API dependencies and tests
+        working-directory: api
+        run: |
+          npm ci
+          npm test
+      - name: Frontend dependencies, tests and build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+  build:
+    name: Publish deployment images
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.OCI_RUNNER }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      api_digest: ${{ steps.api.outputs.digest }}
+      web_digest: ${{ steps.web.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build API
+        id: api
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: ./api
+          target: default
+          platforms: ${{ vars.OCI_PLATFORM }}
+          push: true
+          tags: ghcr.io/skshubham1437/opengym-api:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/skshubham1437/openGym
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Build web
+        id: web
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: web/Dockerfile
+          platforms: ${{ vars.OCI_PLATFORM }}
+          push: true
+          tags: ghcr.io/skshubham1437/opengym-web:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/skshubham1437/openGym
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Record image references
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          API_DIGEST: ${{ steps.api.outputs.digest }}
+          WEB_DIGEST: ${{ steps.web.outputs.digest }}
+        run: |
+          printf 'Commit: `%s`\n\nAPI: `%s`\n\nWeb: `%s`\n' "$RELEASE_SHA" "$API_DIGEST" "$WEB_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy Oracle demo
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: oracle-demo
+    timeout-minutes: 20
+    permissions: {}
+    steps:
+      - name: Deploy exact image digests over SSH
+        env:
+          OCI_HOST: ${{ vars.OCI_HOST }}
+          OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
+          OCI_KNOWN_HOSTS: ${{ secrets.OCI_KNOWN_HOSTS }}
+          RELEASE_SHA: ${{ github.sha }}
+          API_DIGEST: ${{ needs.build.outputs.api_digest }}
+          WEB_DIGEST: ${{ needs.build.outputs.web_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$OCI_HOST"
+          test -n "$OCI_SSH_KEY"
+          test -n "$OCI_KNOWN_HOSTS"
+          key="$RUNNER_TEMP/opengym_ssh_key"
+          hosts="$RUNNER_TEMP/opengym_known_hosts"
+          trap 'rm -f "$key" "$hosts"' EXIT
+          printf '%s\n' "$OCI_SSH_KEY" > "$key"
+          printf '%s\n' "$OCI_KNOWN_HOSTS" > "$hosts"
+          ssh -i "$key" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$hosts" \
+            -o ConnectTimeout=20 \
+            "deploy@$OCI_HOST" \
+            "deploy $RELEASE_SHA $API_DIGEST $WEB_DIGEST"
